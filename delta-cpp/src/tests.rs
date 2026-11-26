@@ -163,9 +163,37 @@ fn malformed_descriptor_is_an_error() {
 
 #[test]
 fn unsupported_locations_are_rejected() {
+    for location in [
+        "relative/path.parquet",
+        "ftp://host/key.parquet",
+        "https://s3.us-west-2.amazonaws.com/bucket/key.parquet",
+    ] {
+        let mut c = ctx("", "");
+        c.file_path = location.into();
+        assert!(new_delta_file_reader(c).is_err(), "{location}");
+    }
+}
+
+#[test]
+fn cloud_locations_are_accepted_without_touching_the_network() {
+    // With a known size and no DV, building the reader does no I/O; only `read` would.
+    for location in [
+        "s3://bucket/t/key.parquet",
+        "s3a://bucket/t/key.parquet",
+        "gs://bucket/t/key.parquet",
+        "abfss://container@account.dfs.core.windows.net/t/key.parquet",
+    ] {
+        let mut c = ctx("", "");
+        c.file_path = location.into();
+        assert!(new_delta_file_reader(c).is_ok(), "{location}");
+    }
+}
+
+#[test]
+fn mismatched_props_are_an_error() {
     let mut c = ctx("", "");
-    c.file_path = "s3://bucket/key.parquet".into();
-    assert!(new_delta_file_reader(c).is_err());
+    c.props_keys = vec!["aws_region".into()];
+    assert!(new_delta_file_reader(c).err().unwrap().contains("mismatch"));
 }
 
 #[test]

@@ -1,6 +1,10 @@
 //! cxx bridge that reads one Delta data file, deletion vector applied, as an Arrow C stream.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 mod reader;
+pub mod store;
 mod util;
 
 // The cxx::bridge expansion uses fully-qualified paths that trip `unused_qualifications`.
@@ -12,9 +16,11 @@ pub mod ffi {
         /// Table directory as a URL (`file:///...`). Needed only for table-relative (`u`) DVs; "" if
         /// unknown. Never guessed from the data file path.
         table_root: String,
-        /// Data file: absolute local path or `file://` URL. Local only for now.
+        /// Data file: an absolute local path, or a URL (`file://`, `s3://`, `s3a://`, `gs://`,
+        /// `abfs://`, `abfss://`, `az://`). Read with the node's own cloud identity unless
+        /// `props_*` say otherwise.
         file_path: String,
-        /// File size in bytes; <= 0 if unknown (one extra request to find the footer).
+        /// File size in bytes; <= 0 if unknown (one extra `head` request).
         file_size: i64,
         /// Deletion vector descriptor as JSON (the decoded `row_index_filter_id_encoded`); ""
         /// means the file has no DV.
@@ -23,7 +29,11 @@ pub mod ffi {
         /// using physical column names and carrying field-id metadata where the table has it.
         /// Required. The kernel matches file columns by field id, then name, and widens types.
         physical_schema_json: String,
-        /// Reserved for object-store options.
+        /// Object-store options as parallel key/value lists, in `object_store`'s config-key syntax
+        /// (e.g. `aws_region`, `aws_endpoint`, `aws_allow_http`, `azure_storage_account_name`).
+        /// Applied on top of the environment and the node's identity; keys the store does not
+        /// recognise are ignored. They may hold credentials and are never logged. Splits with the
+        /// same bucket and options share one connection pool, so keep them stable across splits.
         props_keys: Vec<String>,
         props_values: Vec<String>,
     }
@@ -49,8 +59,9 @@ pub mod ffi {
     }
 }
 
-/// A validated split: location, resolved deleted rows and read options.
+/// A validated split: the engine for its store, location, resolved deleted rows and schema.
 pub struct DeltaFileReader {
+    engine: Arc<store::SharedEngine>,
     file: reader::DataFile,
     schema: delta_kernel::schema::SchemaRef,
     deleted: Option<Vec<u64>>,
@@ -60,14 +71,23 @@ pub fn new_delta_file_reader(
     ctx: ffi::FfiDeltaScanContext,
 ) -> Result<Box<DeltaFileReader>, String> {
     guard_no_runtime("new_delta_file_reader")?;
-    let file = reader::resolve_file(&ctx.file_path, ctx.file_size)?;
+    if ctx.props_keys.len() != ctx.props_values.len() {
+        return Err("props_keys / props_values length mismatch".to_string());
+    }
+    let options: BTreeMap<String, String> = ctx
+        .props_keys
+        .iter()
+        .cloned()
+        .zip(ctx.props_values.iter().cloned())
+        .collect();
+    let location = reader::parse_location(&ctx.file_path)?;
+    let engine = store::engine_for(&location, &options)?;
+    let file = reader::resolve_file(location, ctx.file_size, &engine)?;
     let schema = reader::parse_schema(&ctx.physical_schema_json)?;
-    let deleted = reader::resolve_deleted_rows(
-        &ctx.dv_descriptor_json,
-        &ctx.table_root,
-        reader::shared_engine(),
-    )?;
+    let deleted =
+        reader::resolve_deleted_rows(&ctx.dv_descriptor_json, &ctx.table_root, &options, &engine)?;
     Ok(Box::new(DeltaFileReader {
+        engine,
         file,
         schema,
         deleted,
@@ -77,7 +97,12 @@ pub fn new_delta_file_reader(
 impl DeltaFileReader {
     pub fn read(&self) -> Result<*mut ffi::ArrowArrayStream, String> {
         guard_no_runtime("read")?;
-        let reader = reader::open(&self.file, self.schema.clone(), self.deleted.as_deref())?;
+        let reader = reader::open_with(
+            &*self.engine,
+            &self.file,
+            self.schema.clone(),
+            self.deleted.as_deref(),
+        )?;
         Ok(util::create_raw_pointer_for_record_batch_reader(reader))
     }
 }

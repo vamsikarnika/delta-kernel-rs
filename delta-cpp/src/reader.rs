@@ -1,10 +1,11 @@
 //! Reads one Delta data file with its deletion vector applied.
 //!
 //! A split carries the file, the DV descriptor JSON that Spark hands the scan, and the physical
-//! schema to read. No table snapshot is needed (see `crates/core/examples/dv_descriptor_spike.rs`
-//! on the spike branch). Parquet reading, column matching (field id, then name) and type widening
-//! are the kernel's; this module adds the DV and the Arrow stream.
-use std::sync::{Arc, OnceLock};
+//! schema to read. No table snapshot is needed. Parquet reading, column matching (field id, then
+//! name) and type widening are the kernel's; this module adds the DV and the Arrow stream. Which
+//! object store a file is read from is decided in [`crate::store`].
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -14,48 +15,43 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::{Engine, FileMeta};
-use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-use object_store::local::LocalFileSystem;
+use url::Url;
 
-type SharedEngine = DefaultEngine<TokioBackgroundExecutor>;
-
-/// One engine for every split: it owns a background executor thread, so building one per split
-/// would spawn a thread per file.
-pub fn shared_engine() -> &'static SharedEngine {
-    static ENGINE: OnceLock<SharedEngine> = OnceLock::new();
-    ENGINE.get_or_init(|| DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build())
-}
+use crate::store::{self, SharedEngine};
 
 /// A data file as the kernel wants it.
 pub struct DataFile {
     pub meta: FileMeta,
 }
 
-/// Accepts an absolute local path or a `file://` URL. Other schemes are not supported yet.
-/// `file_size <= 0` means unknown; it is looked up from the filesystem.
-pub fn resolve_file(file_path: &str, file_size: i64) -> Result<DataFile, String> {
-    let local: std::path::PathBuf = if file_path.starts_with("file:") {
-        let url =
-            url::Url::parse(file_path).map_err(|e| format!("bad file url {file_path}: {e}"))?;
-        url.to_file_path()
-            .map_err(|_| format!("file url is not a local path: {file_path}"))?
-    } else if file_path.starts_with('/') {
-        file_path.into()
+/// Parses a data file location: an absolute local path, or a URL (`file://`, `s3://`, `s3a://`,
+/// `gs://`, `abfss://`, ...). A relative path has no store to read from, so it is rejected.
+pub fn parse_location(file_path: &str) -> Result<Url, String> {
+    if file_path.starts_with('/') {
+        Url::from_file_path(file_path).map_err(|_| format!("not an absolute path: {file_path}"))
     } else {
-        return Err(format!(
-            "unsupported data file location (local paths only for now): {file_path}"
-        ));
-    };
+        Url::parse(file_path).map_err(|e| {
+            format!("data file location must be an absolute path or a URL ({e}): {file_path}")
+        })
+    }
+}
+
+/// Resolves the file's size when the caller does not know it (`file_size <= 0`), with one `head`
+/// request on its store.
+pub fn resolve_file(
+    location: Url,
+    file_size: i64,
+    engine: &SharedEngine,
+) -> Result<DataFile, String> {
     let size = if file_size > 0 {
         file_size as u64
     } else {
-        std::fs::metadata(&local)
-            .map_err(|e| format!("cannot stat {file_path}: {e}"))?
-            .len()
+        engine
+            .storage_handler()
+            .head(&location)
+            .map_err(|e| format!("cannot stat {location}: {e}"))?
+            .size
     };
-    let location = url::Url::from_file_path(&local)
-        .map_err(|_| format!("not an absolute path: {file_path}"))?;
     Ok(DataFile {
         meta: FileMeta {
             location,
@@ -80,10 +76,14 @@ pub fn parse_schema(schema_json: &str) -> Result<SchemaRef, String> {
 ///
 /// `table_root` is a directory URL, needed only for storage type `u` (a UUID file relative to the
 /// table). Inline (`i`) and absolute-path (`p`) DVs resolve without it.
+///
+/// A DV file can live in a different bucket than the data file (an absolute-path DV), so it is read
+/// with the engine for its own URL; `data_engine` serves inline DVs, which need no I/O.
 pub fn resolve_deleted_rows(
     descriptor_json: &str,
     table_root: &str,
-    engine: &impl Engine,
+    options: &BTreeMap<String, String>,
+    data_engine: &Arc<SharedEngine>,
 ) -> Result<Option<Vec<u64>>, String> {
     if descriptor_json.is_empty() {
         return Ok(None);
@@ -114,6 +114,13 @@ pub fn resolve_deleted_rows(
             root.set_path(&format!("{}/", root.path()));
         }
         root
+    };
+    let engine = match descriptor
+        .absolute_path(&root)
+        .map_err(|e| format!("bad deletion vector location: {e}"))?
+    {
+        Some(dv_url) => store::engine_for(&dv_url, options)?,
+        None => data_engine.clone(),
     };
     let rows = descriptor
         .row_indexes(engine.storage_handler(), &root)
@@ -226,16 +233,7 @@ impl RecordBatchReader for LiveRows {
     }
 }
 
-/// Opens the file on the shared engine and returns a reader over its live rows.
-pub fn open(
-    file: &DataFile,
-    physical_schema: SchemaRef,
-    deleted: Option<&[u64]>,
-) -> Result<impl RecordBatchReader + Send + 'static, String> {
-    open_with(shared_engine(), file, physical_schema, deleted)
-}
-
-/// Like [`open`], on a given engine.
+/// Opens the file on `engine` and returns a reader over its live rows.
 pub fn open_with(
     engine: &impl Engine,
     file: &DataFile,

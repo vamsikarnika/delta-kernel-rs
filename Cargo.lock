@@ -1580,6 +1580,7 @@ dependencies = [
  "arrow-array 60.0.0",
  "arrow-schema 60.0.0",
  "arrow-select 60.0.0",
+ "bytes",
  "cxx",
  "cxx-build",
  "delta_kernel",
