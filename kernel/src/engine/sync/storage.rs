@@ -73,10 +73,15 @@ impl StorageHandler for SyncStorageHandler {
         let store = self.store.clone();
         let results: Vec<KernelResult<Bytes>> = files
             .into_iter()
-            .map(|(url, _range_opt)| {
+            .map(|(url, range_opt)| {
                 let (s, _, path) = resolve_scope(store.as_ref(), &url)?;
-                let get_result = futures::executor::block_on(s.get(&path))?;
-                Ok(futures::executor::block_on(get_result.bytes())?)
+                match range_opt {
+                    Some(range) => Ok(futures::executor::block_on(s.get_range(&path, range))?),
+                    None => {
+                        let get_result = futures::executor::block_on(s.get(&path))?;
+                        Ok(futures::executor::block_on(get_result.bytes())?)
+                    }
+                }
             })
             .collect();
         Ok(Box::new(results.into_iter()))

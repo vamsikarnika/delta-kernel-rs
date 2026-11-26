@@ -546,27 +546,6 @@ impl DeletionVectorDescriptor {
                             "size_in_bytes doesn't fit in usize for {path}"
                         ))))?;
 
-                let dv_data = storage
-                    .read_files(vec![(path.clone(), None)])?
-                    .next()
-                    .ok_or(KernelError::missing_data(format!(
-                        "No deletion vector data for {path}"
-                    )))??;
-                let dv_data_len = dv_data.len();
-
-                let mut cursor = Cursor::new(dv_data);
-                let mut version_buf = [0; 1];
-                cursor.read(&mut version_buf).map_err(|err| {
-                    KernelError::DeletionVector(format!(
-                        "Failed to read version from {path}: {err}"
-                    ))
-                })?;
-                let version = u8::from_be_bytes(version_buf);
-                require!(
-                    version == 1,
-                    KernelError::DeletionVector(format!("Invalid version {version} for {path}"))
-                );
-
                 // Deletion vector file format:
                 // +---------------+-----------------+
                 // |  num bytes    |  value          |
@@ -582,7 +561,7 @@ impl DeletionVectorDescriptor {
                 // | dv_size - 4   |  bitmap         |
                 // +---------------+-----------------+ <- crc_start
                 // | 4 bytes       |  CRC            |
-                // +---------------+-----------------+
+                // +---------------+-----------------+ <- dv_end
 
                 let this_dv_start: usize =
                     self.offset
@@ -599,14 +578,70 @@ impl DeletionVectorDescriptor {
                 // Safety: size_in_bytes is checked to fit in u32 which for all known platforms
                 // should fix in usize range.
                 let crc_start = this_dv_start + 4 + (size_in_bytes as usize);
+                let dv_end = crc_start + 4;
+
+                // Ask for this DV's bytes only. A DV file can pack the DVs of many data files, and
+                // each split needs just one, so fetching the whole file (which can be large, on
+                // object storage) would be wasted for every other DV in it. When this DV directly
+                // follows the 1-byte version header we start at byte 0 instead, which costs one
+                // byte and keeps the version check; otherwise the version byte is not fetched
+                // (checking it would take a second request) and the size, magic and CRC checks below
+                // still cover this DV.
+                let range_start = if this_dv_start == 1 { 0 } else { this_dv_start };
+                let requested = dv_end - range_start;
+                let dv_data = storage
+                    .read_files(vec![(
+                        path.clone(),
+                        Some(range_start as u64..dv_end as u64),
+                    )])?
+                    .next()
+                    .ok_or(KernelError::missing_data(format!(
+                        "No deletion vector data for {path}"
+                    )))??;
+
+                // `base` is the file position of `dv_data[0]`. A StorageHandler is supposed to
+                // honour the range, but one that returns the whole file instead is still read
+                // correctly: any other length is taken as the whole file, positioned at 0.
+                let base = if dv_data.len() == requested {
+                    range_start
+                } else {
+                    0
+                };
+                let dv_data_len = dv_data.len();
+
+                let mut cursor = Cursor::new(dv_data);
+                if base == 0 {
+                    let mut version_buf = [0; 1];
+                    cursor.read(&mut version_buf).map_err(|err| {
+                        KernelError::DeletionVector(format!(
+                            "Failed to read version from {path}: {err}"
+                        ))
+                    })?;
+                    let version = u8::from_be_bytes(version_buf);
+                    require!(
+                        version == 1,
+                        KernelError::DeletionVector(format!(
+                            "Invalid version {version} for {path}"
+                        ))
+                    );
+                    require!(
+                        this_dv_start < dv_data_len,
+                        KernelError::DeletionVector(format!(
+                            "This DV start is out of bounds for {path} (Offset: {this_dv_start} >= Size: {dv_data_len})"
+                        ))
+                    );
+                }
+                // +4 to account for CRC value
                 require!(
-                    this_dv_start < dv_data_len,
+                    dv_data_len >= dv_end - base,
                     KernelError::DeletionVector(format!(
-                        "This DV start is out of bounds for {path} (Offset: {this_dv_start} >= Size: {dv_data_len})"
+                        "Can't read deletion vector for {path} as there are not enough bytes. Expected {}, but got {}",
+                        dv_end - base,
+                        dv_data_len
                     ))
                 );
 
-                cursor.set_position(this_dv_start as u64);
+                cursor.set_position((this_dv_start - base) as u64);
                 let dv_size = read_u32(&mut cursor, Endian::Big)?;
                 require!(
                     dv_size == size_in_bytes,
@@ -622,31 +657,23 @@ impl DeletionVectorDescriptor {
 
                 let bytes = cursor.into_inner();
 
-                // +4 to account for CRC value
-                require!(
-                    bytes.len() >= crc_start + 4,
-                    KernelError::DeletionVector(format!(
-                        "Can't read deletion vector for {path} as there are not enough bytes. Expected {}, but got {}",
-                        crc_start + 4,
-                        bytes.len()
-                    ))
-                );
-
+                // Positions below are file positions; `base` converts them to indexes in `bytes`.
                 let mut crc_cursor: Cursor<Bytes> =
-                    Cursor::new(bytes.slice(crc_start..crc_start + 4));
+                    Cursor::new(bytes.slice(crc_start - base..dv_end - base));
                 let crc = read_u32(&mut crc_cursor, Endian::Big)?;
                 let crc32 = create_dv_crc32();
                 // CRC is calculated from magic field through end of bitmap
-                // Safety: verified bytes is larger than crc_start + 4, above.
-                let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
+                // Safety: verified bytes holds at least dv_end - base bytes, above.
+                let expected_crc =
+                    crc32.checksum(&bytes.slice(magic_start - base..crc_start - base));
                 require!(
                     crc == expected_crc,
                     KernelError::DeletionVector(format!(
                         "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
                     ))
                 );
-                // Safety: verified bytes is larger than crc_start + 4, above.
-                let dv_bytes = bytes.slice(bitmap_start..crc_start);
+                // Safety: verified bytes holds at least dv_end - base bytes, above.
+                let dv_bytes = bytes.slice(bitmap_start - base..crc_start - base);
                 let cursor = Cursor::new(dv_bytes);
                 RoaringTreemap::deserialize_from(cursor).map_err(|err| {
                     KernelError::DeletionVector(format!(
@@ -1699,5 +1726,241 @@ mod tests {
         assert_eq!(descriptor.offset, Some(7));
         assert_eq!(descriptor.size_in_bytes, 42);
         assert_eq!(descriptor.cardinality, 9);
+    }
+
+    // ---- ranged reads of persisted DVs ----
+
+    use std::ops::Range;
+    use std::sync::Mutex;
+
+    use crate::{FileMeta, FileSlice, KernelResultIteratorStatic};
+
+    /// Wraps a handler, records every requested range and the length of every response. With
+    /// `honor_range = false` it drops the range, as a handler that ignores ranges would.
+    struct RecordingStorage {
+        inner: Arc<dyn StorageHandler>,
+        honor_range: bool,
+        requests: Mutex<Vec<Option<Range<u64>>>>,
+        returned_lens: Mutex<Vec<usize>>,
+    }
+
+    impl RecordingStorage {
+        fn new(honor_range: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: SyncEngine::new().storage_handler(),
+                honor_range,
+                requests: Mutex::new(vec![]),
+                returned_lens: Mutex::new(vec![]),
+            })
+        }
+    }
+
+    impl StorageHandler for RecordingStorage {
+        fn list_from(&self, path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+            self.inner.list_from(path)
+        }
+        fn read_files(
+            &self,
+            files: Vec<FileSlice>,
+        ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+            for (_, range) in &files {
+                self.requests.lock().unwrap().push(range.clone());
+            }
+            let files = if self.honor_range {
+                files
+            } else {
+                files.into_iter().map(|(url, _)| (url, None)).collect()
+            };
+            let out: Vec<Bytes> = self.inner.read_files(files)?.collect::<KernelResult<_>>()?;
+            for b in &out {
+                self.returned_lens.lock().unwrap().push(b.len());
+            }
+            Ok(Box::new(out.into_iter().map(Ok)))
+        }
+        fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
+            self.inner.put(path, data, overwrite)
+        }
+        fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
+            self.inner.copy_atomic(src, dest)
+        }
+        fn head(&self, path: &Url) -> KernelResult<FileMeta> {
+            self.inner.head(path)
+        }
+        fn delete(&self, path: &Url) -> KernelResult<()> {
+            self.inner.delete(path)
+        }
+    }
+
+    /// One DV as stored in a DV file: `[dv_size BE][magic LE][treemap][crc BE]`. Returns the
+    /// record and `dv_size` (magic + treemap), which is what the log's `sizeInBytes` holds.
+    fn dv_record(rows: &[u64]) -> (Vec<u8>, u32) {
+        let treemap: RoaringTreemap = rows.iter().copied().collect();
+        let mut payload = ROARING_BITMAP_PORTABLE_MAGIC.to_le_bytes().to_vec();
+        treemap.serialize_into(&mut payload).unwrap();
+        let crc = create_dv_crc32().checksum(&payload);
+        let mut record = (payload.len() as u32).to_be_bytes().to_vec();
+        record.extend_from_slice(&payload);
+        record.extend_from_slice(&crc.to_be_bytes());
+        (record, payload.len() as u32)
+    }
+
+    /// A DV file holding several DVs after the 1-byte version header, as a writer that packs the
+    /// DVs of many data files into one file produces.
+    struct DvFile {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        url: Url,
+        offsets: Vec<usize>,
+        sizes: Vec<u32>,
+        rows: Vec<Vec<u64>>,
+        len: usize,
+    }
+
+    impl DvFile {
+        fn new(sets: &[&[u64]]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("packed.bin");
+            let mut file = vec![1u8];
+            let (mut offsets, mut sizes) = (vec![], vec![]);
+            for rows in sets {
+                let (record, size) = dv_record(rows);
+                offsets.push(file.len());
+                sizes.push(size);
+                file.extend_from_slice(&record);
+            }
+            std::fs::write(&path, &file).unwrap();
+            let url = Url::from_file_path(&path).unwrap();
+            Self {
+                _dir: dir,
+                path,
+                url,
+                offsets,
+                sizes,
+                rows: sets.iter().map(|r| r.to_vec()).collect(),
+                len: file.len(),
+            }
+        }
+
+        fn descriptor(&self, i: usize) -> DeletionVectorDescriptor {
+            DeletionVectorDescriptor {
+                storage_type: DeletionVectorStorageType::PersistedAbsolute,
+                path_or_inline_dv: self.url.to_string(),
+                offset: Some(self.offsets[i] as i32),
+                size_in_bytes: self.sizes[i] as i32,
+                cardinality: self.rows[i].len() as i64,
+            }
+        }
+
+        /// Position just past DV `i` (its CRC included).
+        fn end(&self, i: usize) -> usize {
+            self.offsets[i] + 4 + self.sizes[i] as usize + 4
+        }
+
+        fn rewrite(&self, f: impl FnOnce(&mut Vec<u8>)) {
+            let mut bytes = std::fs::read(&self.path).unwrap();
+            f(&mut bytes);
+            std::fs::write(&self.path, bytes).unwrap();
+        }
+    }
+
+    fn packed() -> DvFile {
+        DvFile::new(&[&[0, 9], &[3, 4, 5], &[100, 7_000_000_000]])
+    }
+
+    fn read_rows(
+        dv: &DeletionVectorDescriptor,
+        storage: Arc<RecordingStorage>,
+        f: &DvFile,
+    ) -> KernelResult<Vec<u64>> {
+        Ok(dv.read(storage, &f.url)?.iter().collect())
+    }
+
+    #[test]
+    fn read_requests_only_the_bytes_of_this_dv() {
+        let f = packed();
+        let storage = RecordingStorage::new(true);
+        let rows = read_rows(&f.descriptor(1), storage.clone(), &f).unwrap();
+        assert_eq!(rows, vec![3, 4, 5]);
+
+        let (start, end) = (f.offsets[1], f.end(1));
+        assert_eq!(
+            *storage.requests.lock().unwrap(),
+            vec![Some(start as u64..end as u64)]
+        );
+        assert_eq!(*storage.returned_lens.lock().unwrap(), vec![end - start]);
+        assert!(end - start < f.len, "must not fetch the whole file");
+    }
+
+    #[test]
+    fn read_of_the_last_dv_and_a_large_row_number() {
+        let f = packed();
+        let rows = read_rows(&f.descriptor(2), RecordingStorage::new(true), &f).unwrap();
+        assert_eq!(rows, vec![100, 7_000_000_000]);
+    }
+
+    #[test]
+    fn read_of_the_first_dv_starts_at_byte_zero_to_keep_the_version_check() {
+        let f = packed();
+        let storage = RecordingStorage::new(true);
+        let rows = read_rows(&f.descriptor(0), storage.clone(), &f).unwrap();
+        assert_eq!(rows, vec![0, 9]);
+        assert_eq!(
+            *storage.requests.lock().unwrap(),
+            vec![Some(0..f.end(0) as u64)]
+        );
+    }
+
+    #[test]
+    fn read_works_when_the_handler_ignores_the_range() {
+        let f = packed();
+        let storage = RecordingStorage::new(false);
+        let rows = read_rows(&f.descriptor(1), storage.clone(), &f).unwrap();
+        assert_eq!(rows, vec![3, 4, 5]);
+        // It was still asked for the range, and handed the whole file.
+        assert!(storage.requests.lock().unwrap()[0].is_some());
+        assert_eq!(*storage.returned_lens.lock().unwrap(), vec![f.len]);
+    }
+
+    #[test]
+    fn ranged_read_detects_a_corrupted_bitmap() {
+        let f = packed();
+        let flip = f.offsets[1] + 4 + 4 + 1; // inside the treemap of DV 1
+        f.rewrite(|b| b[flip] ^= 0xff);
+        let err = read_rows(&f.descriptor(1), RecordingStorage::new(true), &f).unwrap_err();
+        assert!(err.to_string().contains("CRC32 checksum mismatch"), "{err}");
+        // The neighbouring DVs are unaffected.
+        assert!(read_rows(&f.descriptor(2), RecordingStorage::new(true), &f).is_ok());
+    }
+
+    #[test]
+    fn ranged_read_errors_on_a_truncated_file() {
+        let f = packed();
+        let cut = f.offsets[1] + 10;
+        f.rewrite(|b| b.truncate(cut));
+        assert!(read_rows(&f.descriptor(1), RecordingStorage::new(true), &f).is_err());
+        assert!(read_rows(&f.descriptor(1), RecordingStorage::new(false), &f).is_err());
+    }
+
+    #[test]
+    fn ranged_read_rejects_a_size_that_disagrees_with_the_file() {
+        let f = packed();
+        let mut dv = f.descriptor(1);
+        dv.size_in_bytes += 4;
+        let err = read_rows(&dv, RecordingStorage::new(true), &f).unwrap_err();
+        assert!(err.to_string().contains("DV size mismatch"), "{err}");
+    }
+
+    // The version byte sits at the start of the file, so it is only fetched (and checked) for a
+    // DV that directly follows it. Fetching it for every DV would cost a second request.
+    #[test]
+    fn version_byte_is_checked_only_when_it_is_fetched() {
+        let f = packed();
+        f.rewrite(|b| b[0] = 2);
+        let err = read_rows(&f.descriptor(0), RecordingStorage::new(true), &f).unwrap_err();
+        assert!(err.to_string().contains("Invalid version"), "{err}");
+        assert!(read_rows(&f.descriptor(1), RecordingStorage::new(true), &f).is_ok());
+        // A handler that returns the whole file still gets the check for every DV.
+        let err = read_rows(&f.descriptor(1), RecordingStorage::new(false), &f).unwrap_err();
+        assert!(err.to_string().contains("Invalid version"), "{err}");
     }
 }
