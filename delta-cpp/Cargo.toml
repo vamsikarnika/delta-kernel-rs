@@ -1,0 +1,38 @@
+[package]
+name = "delta-cpp"
+description = "C++ (cxx) binding that reads Delta data files with deletion vectors applied, for Velox"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version = "0.1.0"
+rust-version.workspace = true
+publish = false
+
+# for cargo-release
+[package.metadata.release]
+release = false
+
+[lib]
+# The lib name MUST be "delta" so the cdylib is `libdelta.{dylib,so}`; that name is the
+# CMake/Velox linkage contract, same as libhudi / libiceberg.
+name = "delta"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The Arrow crates must be the same major version the default engine uses (arrow-60), so that
+# RecordBatch and object_store types are the same types on both sides.
+arrow-array = { version = "60", features = ["ffi"] }
+arrow-schema = "60"
+arrow-select = "60"
+cxx = "1.0"
+delta_kernel = { path = "../kernel", features = ["default-engine-base", "internal-api"] }
+delta_kernel_default_engine = { path = "../default-engine" }
+object_store = "0.14.2"
+serde_json = "1"
+tokio = { version = "1.47", features = ["rt"] }
+url = "2"
+
+[build-dependencies]
+cxx-build = "1.0"

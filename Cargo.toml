@@ -3,6 +3,7 @@ members = [
     "acceptance",
     "benchmarks",
     "default-engine",
+    "delta-cpp",
     "default-engine/test-utils",
     "derive-macros",
     "ffi",
