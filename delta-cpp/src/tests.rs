@@ -4,7 +4,6 @@ use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use serde_json::{json, Value};
 
 use crate::ffi::FfiDeltaScanContext;
-use crate::reader::drop_deleted;
 use crate::{delta_free_arrow_stream, new_delta_file_reader};
 
 const VALUE_INT: &str = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
@@ -252,49 +251,6 @@ fn batch_schema_matches_stream_schema() {
         batches[0].schema().field(0).data_type(),
         &arrow_schema::DataType::Int32
     );
-}
-
-/// Builds `n` rows with values `start..start+n`.
-fn batch(start: i32, n: i32) -> RecordBatch {
-    let col = Int32Array::from((start..start + n).collect::<Vec<_>>());
-    RecordBatch::try_from_iter([("v", std::sync::Arc::new(col) as _)]).unwrap()
-}
-
-fn live_values(batches: &[(i32, i32)], deleted: &[u64]) -> Vec<i32> {
-    let mut cursor = 0;
-    let mut offset = 0u64;
-    let mut out = vec![];
-    for &(start, n) in batches {
-        let b = drop_deleted(batch(start, n), offset, deleted, &mut cursor).unwrap();
-        out.extend(
-            b.column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .values(),
-        );
-        offset += n as u64;
-    }
-    out
-}
-
-#[test]
-fn deleted_rows_are_dropped_across_batch_boundaries() {
-    // Two batches of 4: rows 0..4 and 4..8. Delete one at each edge of the boundary, plus a run.
-    assert_eq!(live_values(&[(0, 4), (4, 4)], &[3, 4]), [0, 1, 2, 5, 6, 7]);
-    assert_eq!(
-        live_values(&[(0, 4), (4, 4)], &[]),
-        [0, 1, 2, 3, 4, 5, 6, 7]
-    );
-    assert_eq!(live_values(&[(0, 4), (4, 4)], &[0, 1, 2, 3]), [4, 5, 6, 7]);
-    assert_eq!(live_values(&[(0, 4), (4, 4)], &[7]), [0, 1, 2, 3, 4, 5, 6]);
-    // A batch with nothing deleted in it passes through untouched.
-    assert_eq!(
-        live_values(&[(0, 2), (2, 2), (4, 2)], &[4]),
-        [0, 1, 2, 3, 5]
-    );
-    // Everything deleted leaves an empty batch, not an error.
-    assert!(live_values(&[(0, 3)], &[0, 1, 2]).is_empty());
 }
 
 const Z85: &[u8; 85] =

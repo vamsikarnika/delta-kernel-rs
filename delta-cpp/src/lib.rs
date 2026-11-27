@@ -102,6 +102,7 @@ impl DeltaFileReader {
             &self.file,
             self.schema.clone(),
             self.deleted.as_deref(),
+            None,
         )?;
         Ok(util::create_raw_pointer_for_record_batch_reader(reader))
     }

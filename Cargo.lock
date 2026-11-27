@@ -1586,6 +1586,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "object_store 0.14.2",
+ "parquet 60.0.0",
  "serde_json",
  "tokio",
  "url",

@@ -36,6 +36,7 @@ url = "2"
 
 [dev-dependencies]
 bytes = "1"
+parquet = "60"
 
 [build-dependencies]
 cxx-build = "1.0"
